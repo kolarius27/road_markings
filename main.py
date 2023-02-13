@@ -2,7 +2,6 @@ from bs4 import BeautifulSoup
 import pandas as pd
 from shapely.geometry import box
 from shapely.geometry import Polygon, MultiPolygon
-from shapely.ops import clip_by_rect
 from selenium import webdriver
 import requests
 import os
@@ -20,13 +19,16 @@ from rasterio.merge import merge
 from rasterio.windows import Window
 from rasterio.io import MemoryFile
 from rasterio.mask import mask
+from rasterio.features import rasterize
 import rasterio as rio
 import matplotlib.pyplot as plt
+import numpy as np
+import glob
 
 
 def main():
     # city county
-    mestska_cast = "Praha 11"
+    mestska_cast = "Praha 3"
     crosswalks_name = mestska_cast.replace(' ', '') + "_prechody.shp"
     sikme_pruhy_name = mestska_cast.replace(' ', '') + "_sikmepruhy.shp"
 
@@ -47,12 +49,9 @@ def main():
     county_data = prague_data.loc[prague_data['NAZEV'] == mestska_cast]
     county_geom = county_data.iloc[0]['geometry']
 
-    # create roads buffer geometry
-    # roads_buffer_data = gpd.GeoDataFrame.from_file(roads_buffer_path)
-    # roads_buffer_geom = roads_buffer_data.iloc[0]['geometry']
-    # roads_buffer_clip = gpd.clip(roads_buffer_data.buffer(0), county_data)
-    # roads_buffer_clip.to_file
-
+    # get roads buffer geometry by county
+    roads_buffer_data = gpd.GeoDataFrame.from_file(roads_buffer_path)
+    roads_buffer_geom = roads_buffer_data.loc[roads_buffer_data['NAZEV'] == mestska_cast]['geometry']
 
     # envelope
     county_envelope = my_envelope(county_geom, 20, 'envelope')
@@ -64,21 +63,29 @@ def main():
     
     # download images
     prepare_ortophotos(jgw_subset, mestska_cast)
+    print('orthophotos downloaded')
 
     # clip by buffer
-
+    clip_orthophotos(jgw_subset, roads_buffer_geom)
+    print('ortophotos clipped')
 
     # create screenshots
     if os.path.exists(crosswalks_path) is True:
         crosswalks = gpd.GeoDataFrame.from_file(crosswalks_path)
+        
         create_screenshots(jgw_subset, crosswalks)
+        print('screens completed')
+        # save crosswalks
+        crosswalks.to_file(crosswalks_path)
+        print('crosswalks saved')
+
 
 
 def create_dirs(county_name):
     county_dir = os.path.join("data", county_name)
     if not os.path.exists(county_dir):
         os.mkdir(county_dir)
-    for folder in ['crosswalks', 'ortofoto', 'roads_buffer', 'roads_orto', 'screens']:
+    for folder in ['crosswalks', 'ortofoto', 'roads_orto']:
         folder_path = os.path.join(county_dir, folder)
         if not os.path.exists(folder_path):
             os.mkdir(folder_path)
@@ -209,13 +216,24 @@ def merge_orthophotos(subset, extent):
     return mosaic, out_meta
 
 
-def clip_orthophotos():
-    pass
+def clip_orthophotos(subset, geoms):
+    for jpg, s_geom in zip(subset['jpg'], subset['geometry']):
+        split_jpg = jpg.split('\\')
+        output_tif = os.path.join(split_jpg[0], split_jpg[1], 'roads_orto', split_jpg[-1][:-3] + 'tif')
+        if not os.path.exists(output_tif):
+            intersect_geom = False
+            for geom in geoms:
+                intersect_geom = geom.intersects(s_geom)
+            if intersect_geom is True:
+                print(jpg)
+                mosaic, meta = clip_orthophoto(jpg, geoms)
+                with rio.open(output_tif, 'w', **meta) as dst:
+                    dst.write(mosaic)
 
 
 def clip_orthophoto(raster_path, poly):
     with rio.open(raster_path) as src:
-        mosaic, transform = mask(src, [poly], crop=True)
+        mosaic, transform = mask(src, poly, crop=False)
         out_meta = update_meta(src, mosaic, transform)
     return mosaic, out_meta
 
@@ -234,38 +252,59 @@ def update_meta(raster, mosaic, output):
     return meta
 
 
-def create_img():
-    pass
+def create_img(img_path ,mosaic, meta, fid, row):
+    geom = row['geometry'].boundary
+    geometry = gpd.GeoSeries([geom])
+    # fig = plt.figure(frameon=False)
+    # ax = fig.add_axes([0, 0, 1, 1])
+    # ax.axis('off')
+
+
+    red = rasterize(((g, 255) for g in geometry), transform=meta['transform'], out=mosaic[0].copy(), all_touched=True)
+    green = rasterize(((g, 0) for g in geometry), transform=meta['transform'], out=mosaic[1].copy(), all_touched=True)
+    blue = rasterize(((g, 0) for g in geometry), transform=meta['transform'], out=mosaic[2].copy(), all_touched=True)
+    image = np.array([red, green, blue])
+    # show(image, transform=meta['transform'], ax=ax, cmap='Spectral')
+    # geometry.plot(ax=ax, facecolor='none', edgecolor='red')
+    # plt.savefig(img_path, bbox_inches='tight', pad_inches = 0)
+    with rio.open(img_path, 'w', **meta) as dst:
+        dst.write(image)
+    # plt.show()
+
+
+def check_files(list_of_features, folder, extension):
+    if len(list_of_features) == len(glob.glob(os.path.join(folder, '*.{}'.format(extension)))):
+        return True
+    else:
+        return False
 
 
 
 def create_screenshots(subset, crosswalks):
+    img_list = []
+    i=0
     
-    for _, row in crosswalks.iterrows():
-        feature_geom = row['geometry']
-        extent = my_envelope(feature_geom, 5, 'square')
-        subset_crosswalks = subset_of_jgw(subset, extent)
-        if subset_crosswalks.shape[0] > 1:
-            mosaic, meta = merge_orthophotos(subset_crosswalks, extent)
-        else:
-            # ext_feature = gpd.GeoDataFrame(geometry=extent, crs="EPSG:5514")
-            mosaic, meta = clip_orthophoto(subset_crosswalks.iloc[0]['jpg'], extent)
+    for fid, row in crosswalks.iterrows():
+        mestska_cast = row['Mest_cast']
+        img_name = 'img/{}_{}.jpg'.format(mestska_cast.replace(' ', ''), fid)
+        img_path = os.path.join('data', mestska_cast, 'crosswalks', img_name)
 
+        if not os.path.exists(img_path):
+            extent = my_envelope(row['geometry'], 5, 'square')
+            subset_crosswalks = subset_of_jgw(subset, extent)
+            if subset_crosswalks.shape[0] > 1:
+                mosaic, meta = merge_orthophotos(subset_crosswalks, extent)
+            else:
+                # ext_feature = gpd.GeoDataFrame(geometry=extent, crs="EPSG:5514")
+                mosaic, meta = clip_orthophoto(subset_crosswalks.iloc[0]['jpg'], [extent])
 
-        g = gpd.GeoSeries([feature_geom])
-        
-        fig, ax = plt.subplots(figsize=(12, 8))
-        show(mosaic,transform=meta['transform'], ax=ax, cmap='Spectral')
+            create_img(mosaic, meta, fid, row)
 
+        img_list.append(img_name)
+        i+=1
+        print(i)
 
-        g.plot(ax=ax, facecolor='none', edgecolor='red')
-        print(type(ax))
-        plt.savefig('foo.png', bbox_inches='tight')
-        plt.show()
-
-
-
-
+    crosswalks['img'] = img_list
 
 
 if __name__ == '__main__':
